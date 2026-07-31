@@ -19,7 +19,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+from lyrics import LyricsLine, current_line_index, fetch_synced_lyrics
 
 try:
     from dotenv import load_dotenv
@@ -32,6 +34,11 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 CURRENTLY_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
 SCOPE = "user-read-currently-playing"
+
+# The two things the matrix can show. Switched at runtime via ModeControlServer,
+# e.g. from an iPhone Home Screen widget hitting /mode/lyrics or /mode/art.
+MODE_ART = "art"
+MODE_LYRICS = "lyrics"
 
 
 @dataclass
@@ -47,6 +54,14 @@ class SharedPlaybackState:
     image_url: str | None = None
     image: Image.Image | None = None
     is_playing: bool = False
+
+    # Added for the lyrics display and the phone-widget mode switch.
+    track_key: str | None = None
+    duration_ms: int | None = None
+    progress_ms: int = 0
+    progress_captured_at: float = 0.0
+    lyrics: list[LyricsLine] | None = None
+    mode: str = MODE_ART
 
 
 @dataclass
@@ -301,6 +316,71 @@ class LocalCallbackServer:
         return self.code
 
 
+class ModeControlServer:
+    """Tiny local HTTP server so a phone widget can switch the matrix between
+    the spinning album art and scrolling lyrics. Independent of the Spotify
+    OAuth callback server above -- this one just flips SharedPlaybackState.mode.
+
+    GET /mode          -> {"mode": "art"|"lyrics"}
+    GET /mode/art      -> switch to album art, returns the new mode
+    GET /mode/lyrics   -> switch to lyrics, returns the new mode
+    GET /mode/toggle   -> flip between the two, returns the new mode
+    """
+
+    def __init__(self, host: str, port: int, state: SharedPlaybackState, state_lock: threading.Lock) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                path = urllib.parse.urlparse(self.path).path
+
+                if path == "/mode/art":
+                    with state_lock:
+                        state.mode = MODE_ART
+                elif path == "/mode/lyrics":
+                    with state_lock:
+                        state.mode = MODE_LYRICS
+                elif path == "/mode/toggle":
+                    with state_lock:
+                        state.mode = MODE_LYRICS if state.mode == MODE_ART else MODE_ART
+                elif path != "/mode":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                with state_lock:
+                    body = json.dumps({"mode": state.mode}).encode("utf-8")
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        try:
+            self.server = HTTPServer((host, port), Handler)
+        except OSError as exc:
+            if exc.errno == 98:  # EADDRINUSE
+                raise SystemExit(
+                    f"Could not start the mode-control server on {host}:{port} -- that port is "
+                    "already in use. This usually means a previous spotify_matrix.py process is "
+                    "still running in the background. Find it with `ps aux | grep spotify_matrix` "
+                    "and stop it with `sudo pkill -f spotify_matrix.py`, or pass a different "
+                    "--control-port."
+                ) from exc
+            raise
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
 class MatrixDisplay:
     def __init__(self, args: argparse.Namespace) -> None:
         try:
@@ -382,6 +462,56 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
         image_url=image["url"],
         is_playing=bool(playback.get("is_playing")),
     )
+
+
+@dataclass
+class TrackMeta:
+    key: str
+    artist: str
+    title: str
+    album: str | None
+    duration_ms: int | None
+    progress_ms: int
+
+
+def track_meta_from_response(playback: dict[str, Any] | None) -> TrackMeta | None:
+    """Extract the fields needed for a lyrics lookup. Separate from
+    playback_art_from_response so that function stays exactly as it was."""
+    if not playback:
+        return None
+
+    item = playback.get("item")
+    if not item or item.get("type") != "track":
+        return None  # Lyrics lookup only makes sense for tracks, not podcast episodes.
+
+    artists = item.get("artists") or []
+    artist = artists[0].get("name") if artists else ""
+    title = item.get("name") or ""
+    album = (item.get("album") or {}).get("name")
+    item_id = item.get("id") or item.get("uri")
+
+    return TrackMeta(
+        key=str(item_id),
+        artist=artist,
+        title=title,
+        album=album,
+        duration_ms=item.get("duration_ms"),
+        progress_ms=int(playback.get("progress_ms") or 0),
+    )
+
+
+def estimate_position_seconds(
+    duration_ms: int | None,
+    progress_ms: int,
+    progress_captured_at: float,
+    is_playing: bool,
+) -> float:
+    """Interpolate playback position between Spotify polls so lyrics scroll smoothly."""
+    if not duration_ms:
+        return 0.0
+    elapsed_ms = (time.monotonic() - progress_captured_at) * 1000.0 if is_playing else 0.0
+    position_ms = progress_ms + elapsed_ms
+    return max(0.0, min(position_ms, duration_ms)) / 1000.0
 
 
 def download_image(url: str) -> Image.Image:
@@ -471,6 +601,172 @@ def render_test_pattern(size: int, offset: int) -> Image.Image:
     return frame
 
 
+def load_lyrics_font(pixel_size: int, font_path: Path | None) -> ImageFont.FreeTypeFont:
+    if font_path:
+        try:
+            return ImageFont.truetype(str(font_path), pixel_size)
+        except OSError:
+            print(f"Could not load --lyrics-font {font_path}, falling back to the default font.", flush=True)
+    try:
+        return ImageFont.load_default(size=pixel_size)  # Pillow >= 9.2
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _wrap_text(text: str, font: ImageFont.ImageFont, max_width: int, draw: ImageDraw.ImageDraw) -> list[str]:
+    """Word-wrap text to fit max_width at the given (constant) font size."""
+    words = text.split()
+    if not words:
+        return [text]
+
+    wrapped: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if draw.textlength(candidate, font=font) <= max_width:
+            current = candidate
+        else:
+            wrapped.append(current)
+            current = word
+    wrapped.append(current)
+    return wrapped
+
+
+def _ease_in_out(t: float) -> float:
+    """Smootherstep easing (Perlin's improved curve) -- more gradual accelerate/
+    decelerate than plain smoothstep, so the glide reads less abrupt."""
+    t = min(1.0, max(0.0, t))
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+
+
+def render_lyrics(
+    lines: list[LyricsLine] | None,
+    position_seconds: float,
+    size: int,
+    font: ImageFont.ImageFont,
+    line_height: int,
+    transition_seconds: float = 0.6,
+) -> Image.Image:
+    """Vertically scrolling lyrics, current line highlighted.
+
+    Every row is drawn at the same font size -- only the color changes for
+    the active line. Long lyric lines are word-wrapped (not shrunk) to fit
+    within a margin on either side of the matrix. The active line holds
+    steady while it plays, then glides up into the next line only during a
+    short transition window right before the next line's timestamp -- so it
+    tracks the song instead of creeping the whole time between lines. If a
+    line wraps onto multiple rows, the whole wrapped block is centered (not
+    just its first row), so none of it runs off the bottom edge.
+    """
+    frame = Image.new("RGB", (size, size), (0, 0, 0))
+    draw = ImageDraw.Draw(frame)
+
+    if not lines:
+        draw.text((size // 2, size // 2), "...", fill=(90, 90, 90), font=font, anchor="mm")
+        return frame
+
+    margin = max(2, size // 16)
+    max_text_width = size - margin * 2
+
+    current_index = current_line_index(lines, position_seconds)
+
+    # Hold the line steady, then glide into place during a short window that
+    # ends exactly as the next line starts -- capped so it never eats into
+    # more than half the gap for back-to-back lyric lines.
+    progress_within_line = 0.0
+    if 0 <= current_index < len(lines) - 1:
+        line_start = lines[current_index].time_seconds
+        line_end = lines[current_index + 1].time_seconds
+        span = max(0.01, line_end - line_start)
+        transition = min(transition_seconds, span * 0.5)
+        transition_start = line_end - transition
+        if position_seconds >= transition_start:
+            raw_progress = (position_seconds - transition_start) / transition
+            progress_within_line = _ease_in_out(raw_progress)
+
+    base_index = max(current_index, 0)
+    center_y = size // 2
+
+    # Wrap only the lyric lines actually visible around the active one -- cheap,
+    # since it's at most ~10 lines per frame, not the whole song.
+    window_start = max(0, base_index - 3)
+    window_end = min(len(lines), base_index + 7)
+    rows: list[tuple[int, str]] = []  # (original_line_index, wrapped sub-line text)
+    for index in range(window_start, window_end):
+        for sub_line in _wrap_text(lines[index].text, font, max_text_width, draw):
+            rows.append((index, sub_line))
+
+    # first_row_offset / row_count of each lyric line's wrapped block, so we can
+    # center the whole block (not just its first row) at center_y.
+    line_spans: dict[int, tuple[int, int]] = {}
+    for row_offset, (original_index, _text) in enumerate(rows):
+        first_offset, count = line_spans.get(original_index, (row_offset, 0))
+        line_spans[original_index] = (first_offset, count + 1)
+
+    def block_top_y(index: int) -> float:
+        first_offset, count = line_spans.get(index, (0, 1))
+        return center_y - (count - 1) / 2.0 * line_height - first_offset * line_height
+
+    top_y_start = block_top_y(base_index)
+    top_y_end = block_top_y(base_index + 1) if base_index + 1 in line_spans else top_y_start
+    top_y = top_y_start + (top_y_end - top_y_start) * progress_within_line
+
+    for row_offset, (original_index, text) in enumerate(rows):
+        y = top_y + row_offset * line_height
+        if y < -line_height or y > size + line_height:
+            continue
+        if original_index == current_index:
+            color = (255, 255, 255)
+        elif original_index < current_index:
+            color = (55, 55, 65)
+        else:
+            color = (90, 90, 100)
+        draw.text((size // 2, y), text, fill=color, font=font, anchor="mm")
+
+    return frame
+
+
+def _fetch_and_store_lyrics(
+    state: SharedPlaybackState,
+    state_lock: threading.Lock,
+    meta: TrackMeta,
+) -> None:
+    """Runs on its own thread so a slow/failed lrclib lookup never blocks Spotify polling."""
+    lyrics = fetch_synced_lyrics(
+        meta.artist,
+        meta.title,
+        meta.album,
+        (meta.duration_ms / 1000.0) if meta.duration_ms else None,
+    )
+    with state_lock:
+        # Only apply if the user hasn't already skipped to a different track
+        # while this lookup was in flight -- avoids showing stale lyrics.
+        if state.track_key == meta.key:
+            state.lyrics = lyrics
+    print(
+        f"Lyrics: {'found' if lyrics else 'not found'} for {meta.artist} - {meta.title}",
+        flush=True,
+    )
+
+
+def _fetch_and_store_art_image(
+    state: SharedPlaybackState,
+    state_lock: threading.Lock,
+    art: PlaybackArt,
+) -> None:
+    """Runs on its own thread so downloading album art never blocks Spotify polling."""
+    try:
+        image = download_image(art.image_url)
+    except Exception as exc:
+        print(f"Album art download failed: {exc}", flush=True)
+        return
+    with state_lock:
+        # Only apply if this is still the current track's art -- avoids a late
+        # download landing after the user has already skipped past it.
+        if state.art_key == art.key:
+            state.image = image
+
+
 def poll_spotify(
     spotify: SpotifyClient,
     state: SharedPlaybackState,
@@ -488,23 +784,46 @@ def poll_spotify(
             if art:
                 with state_lock:
                     needs_download = art.key != state.art_key or art.image_url != state.image_url
-
-                image = download_image(art.image_url) if needs_download else None
-
-                with state_lock:
                     state.art_key = art.key
                     state.image_url = art.image_url
                     state.is_playing = art.is_playing
-                    if image is not None:
-                        state.image = image
+
+                if needs_download:
+                    threading.Thread(
+                        target=_fetch_and_store_art_image,
+                        args=(state, state_lock, art),
+                        daemon=True,
+                    ).start()
 
                 status = f"art found, is_playing={art.is_playing}"
+
+                # Lyrics lookup, added alongside the existing art handling above.
+                meta = track_meta_from_response(playback)
+                if meta:
+                    with state_lock:
+                        state.progress_ms = meta.progress_ms
+                        state.progress_captured_at = time.monotonic()
+                        is_new_track = meta.key != state.track_key
+                        state.track_key = meta.key
+                        state.duration_ms = meta.duration_ms
+
+                    if is_new_track:
+                        with state_lock:
+                            state.lyrics = None  # clear immediately -- don't show the previous track's lyrics
+                        threading.Thread(
+                            target=_fetch_and_store_lyrics,
+                            args=(state, state_lock, meta),
+                            daemon=True,
+                        ).start()
             else:
                 with state_lock:
                     state.art_key = None
                     state.image_url = None
                     state.image = None
                     state.is_playing = False
+                    state.track_key = None
+                    state.duration_ms = None
+                    state.lyrics = None
                 status = "no currently playing item"
 
             if status != last_status:
@@ -584,6 +903,16 @@ def run(args: argparse.Namespace) -> None:
     )
     poll_thread.start()
 
+    control_server = ModeControlServer(args.control_host, args.control_port, playback_state, playback_lock)
+    control_server.start()
+    print(
+        f"Mode control listening on http://{args.control_host}:{args.control_port} "
+        "(GET /mode, /mode/art, /mode/lyrics, /mode/toggle)",
+        flush=True,
+    )
+    lyrics_font = load_lyrics_font(args.lyrics_font_size, args.lyrics_font)
+    lyrics_line_height = args.lyrics_font_size + 2
+
     angle = 0.0
     last_frame = time.monotonic()
 
@@ -593,6 +922,11 @@ def run(args: argparse.Namespace) -> None:
             with playback_lock:
                 current_art_image = playback_state.image
                 is_playing = playback_state.is_playing
+                mode = playback_state.mode
+                lyrics_lines = playback_state.lyrics
+                duration_ms = playback_state.duration_ms
+                progress_ms = playback_state.progress_ms
+                progress_captured_at = playback_state.progress_captured_at
 
             now = time.monotonic()
             delta = now - last_frame
@@ -601,7 +935,21 @@ def run(args: argparse.Namespace) -> None:
             if is_playing and current_art_image is not None:
                 angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
 
-            image = render_record(current_art_image, angle, size) if current_art_image else idle
+            if mode == MODE_LYRICS and lyrics_lines:
+                position_seconds = (
+                    estimate_position_seconds(duration_ms, progress_ms, progress_captured_at, is_playing)
+                    + args.lyrics_offset
+                )
+                image = render_lyrics(
+                    lyrics_lines,
+                    position_seconds,
+                    size,
+                    lyrics_font,
+                    lyrics_line_height,
+                    args.lyrics_transition_seconds,
+                )
+            else:
+                image = render_record(current_art_image, angle, size) if current_art_image else idle
             display.show(image)
 
             if args.once:
@@ -614,6 +962,7 @@ def run(args: argparse.Namespace) -> None:
     finally:
         stop_event.set()
         poll_thread.join(timeout=1)
+        control_server.stop()
         display.clear()
 
 
@@ -657,6 +1006,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-pattern", action="store_true", help="Show a bright moving color test pattern without using Spotify.")
     parser.add_argument("--once", action="store_true", help="Render one frame and exit.")
     parser.add_argument("--no-browser", action="store_true", help="Print the Spotify auth URL without trying to open a browser.")
+    parser.add_argument("--control-host", default="0.0.0.0", help="Host for the phone-widget mode-switch server.")
+    parser.add_argument("--control-port", type=int, default=8890, help="Port for the phone-widget mode-switch server.")
+    parser.add_argument("--lyrics-font", type=Path, help="Path to a .ttf/.otf font for lyrics text (recommended; the bundled default font is small and blocky).")
+    parser.add_argument("--lyrics-font-size", type=int, default=9, help="Pixel size for lyrics text. Stays constant -- only the active line's color changes.")
+    parser.add_argument("--lyrics-offset", type=float, default=0.0, help="Seconds to shift lyrics timing forward (+) or back (-) to compensate for network/API lag.")
+    parser.add_argument("--lyrics-transition-seconds", type=float, default=0.6, help="How long the glide into the next lyric line takes, right before it starts.")
     return parser
 
 
