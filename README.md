@@ -4,6 +4,8 @@ Shows the current Spotify album art on a 64x64 RGB matrix as a circular record. 
 
 This uses Spotify's Web API `currently-playing` endpoint, not the browser-only Web Playback SDK. The first run opens Spotify OAuth, then the script stores a refresh token in `.cache/spotify_token.json`.
 
+Can switch the display to lyrics using an iPhone shortcut widget.
+
 ## Files
 
 - `spotify_matrix.py` - Pi runtime script.
@@ -76,3 +78,8 @@ To verify the album art is what spins on the disk, render four local preview fra
 ```bash
 python spotify_matrix.py --preview-frames /tmp/spotify-matrix-preview
 ```
+
+## Shortcut Widget
+
+Get contents of url
+http://PI_HOST:8890/mode/toggle
