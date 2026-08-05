@@ -8,7 +8,7 @@ Can switch the display to lyrics using an iPhone shortcut widget.
 
 ## Files
 
-- `spotify_matrix.py` - Pi runtime script.
+- `spotify_matrix2.py` - Pi runtime script.
 - `lyrics.py` - LRCLIB API for lyrics sync.
 - `.env` - local Spotify credentials, ignored by Git.
 - `.env.example` - template for recreating local config.
