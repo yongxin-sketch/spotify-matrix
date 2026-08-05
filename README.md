@@ -9,6 +9,7 @@ Can switch the display to lyrics using an iPhone shortcut widget.
 ## Files
 
 - `spotify_matrix.py` - Pi runtime script.
+- `lyrics.py` - LRCLIB API for lyrics sync.
 - `.env` - local Spotify credentials, ignored by Git.
 - `.env.example` - template for recreating local config.
 - `requirements.txt` - Python dependencies, excluding the hardware-specific RGB matrix bindings.
@@ -24,8 +25,6 @@ pip install -r requirements.txt
 ```
 
 The `--system-site-packages` flag is useful if the `rgbmatrix` bindings were installed system-wide.
-
-This install sometimes crashes the raspberry pi zero, I had to do some fancy workarounds. Might be easier to use a pi with more memory!
 
 ## Spotify setup
 
